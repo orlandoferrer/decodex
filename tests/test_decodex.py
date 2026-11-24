@@ -5,6 +5,7 @@ from pathlib import Path
 import plistlib
 import pty
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,8 @@ class DecodexTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="decodex tests ")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.applications = self.root / "Applications"
+        self.user_home = self.root / "home"
         self.app = self.root / "codex home" / "computer-use" / "Codex Computer Use.app"
         self.bundle(self.app, "com.example.computeruse")
         helpers = self.app / "Contents" / "SharedSupport"
@@ -38,6 +41,9 @@ class DecodexTests(unittest.TestCase):
         # Only the temporary test copy can call the mock. Never run the source
         # script's actual reset command during tests.
         self.assertEqual(source.count("/usr/bin/tccutil"), 1)
+        # Isolate automatic discovery from apps installed on the test machine.
+        self.assertEqual(source.count('"/Applications"'), 1)
+        source = source.replace('"/Applications"', shlex.quote(str(self.applications)))
         self.script = self.root / "decodex.sh"
         self.script.write_text(source.replace("/usr/bin/tccutil", shlex.quote(str(mock))))
 
@@ -50,6 +56,7 @@ class DecodexTests(unittest.TestCase):
 
     def run_script(self, *args, reply=None, fail_service="", cwd=None):
         env = dict(os.environ, RESET_LOG=str(self.log), FAIL_SERVICE=fail_service)
+        env["HOME"] = str(self.user_home)
         # Exercise the default CODEX_HOME discovery path as well as --app.
         env["CODEX_HOME"] = str(self.root / "codex home")
         command = ["/bin/bash", str(self.script), *args]
@@ -83,11 +90,15 @@ class DecodexTests(unittest.TestCase):
             self.assertEqual(result.stdout.count(identifier), 1)
         self.assertNotIn("invalid id", result.stdout)
         self.assertIn("AppleEvents (Automation)", result.stdout)
+        self.assertNotIn("Optional parameters for another run:", result.stdout)
         self.assertEqual(self.resets(), [])
 
     def test_one_confirmation_resets_all_components_and_services(self):
         result = self.run_script(reply="y\n")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Optional parameters for another run:", result.stdout)
+        for option in ("--include-main-apps", "--diagnose", "--app PATH", "--main-app PATH", "--help"):
+            self.assertIn(option, result.stdout)
         expected = {
             f"reset {service} {identifier}"
             for service in ("Accessibility", "ScreenCapture", "AppleEvents")
@@ -172,15 +183,125 @@ class DecodexTests(unittest.TestCase):
         self.assertEqual(self.resets(), [])
 
     def test_missing_app_value_is_rejected_before_any_prompt(self):
-        for suffix in ((), ("",), ("--diagnose",), ("--help",), ("-h",), ("--app",)):
-            with self.subTest(suffix=suffix):
-                # These replies would allow the old parser's fallback/reset flow.
-                result = self.run_script("--app", *suffix, reply=f"{self.app}\ny\n")
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn("--app requires a path", result.stderr)
-                self.assertNotIn("Enter the full path", result.stderr)
+        for option in ("--app", "--main-app"):
+            for suffix in ((), ("",), ("--diagnose",), ("--help",), ("-h",), ("--app",), ("--main-app",), ("--include-main-apps",)):
+                with self.subTest(option=option, suffix=suffix):
+                    result = self.run_script(option, *suffix, reply=f"{self.app}\ny\n")
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(f"{option} requires a path", result.stderr)
+                    self.assertNotIn("[y/N]", result.stderr)
+                    self.assertEqual(self.resets(), [])
+
+    def install_main_apps(self):
+        # App names need not resemble their dynamically read bundle IDs.
+        chatgpt = self.applications / "ChatGPT.app"
+        codex = self.user_home / "Applications" / "Codex.app"
+        self.bundle(chatgpt, "com.example.mainchat")
+        self.bundle(codex, "com.example.maincode")
+        self.bundle(self.applications / "Unrelated.app", "com.example.unrelated")
+        self.bundle(chatgpt / "Contents" / "SharedSupport" / "Helper.app", "com.example.mainhelper")
+        return chatgpt, codex
+
+    def test_main_apps_and_computer_use_share_one_confirmation(self):
+        self.install_main_apps()
+        result = self.run_script("--include-main-apps", reply="yes\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("[y/N]"), 1)
+        expected_ids = {"com.example.computeruse", "com.example.client", "com.example.worker",
+                        "com.example.mainchat", "com.example.maincode"}
+        self.assertEqual(set(self.resets()), {
+            f"reset {service} {identifier}"
+            for service in ("Accessibility", "ScreenCapture", "AppleEvents")
+            for identifier in expected_ids
+        })
+        self.assertEqual(len(self.resets()), 15)
+
+    def test_main_apps_are_listed_in_diagnose_without_resets(self):
+        self.install_main_apps()
+        result = self.run_script("--diagnose", "--include-main-apps")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for identifier in ("com.example.mainchat", "com.example.maincode"):
+            self.assertIn(identifier, result.stdout)
+        self.assertNotIn("com.example.unrelated", result.stdout)
+        self.assertNotIn("com.example.mainhelper", result.stdout)
+        self.assertEqual(self.resets(), [])
+
+    def test_cancellation_covers_main_apps_and_computer_use(self):
+        self.install_main_apps()
+        result = self.run_script("--include-main-apps", reply="\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("com.example.mainchat", result.stdout)
+        self.assertEqual(result.stderr.count("[y/N]"), 1)
+        self.assertEqual(self.resets(), [])
+
+    def test_main_apps_work_without_computer_use(self):
+        self.install_main_apps()
+        shutil.rmtree(self.app)
+        result = self.run_script("--include-main-apps", reply="y\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Computer Use not found", result.stderr)
+        self.assertEqual(len(self.resets()), 6)
+        self.assertEqual({line.split()[2] for line in self.resets()},
+                         {"com.example.mainchat", "com.example.maincode"})
+
+    def test_missing_all_installations_fails_without_prompt(self):
+        shutil.rmtree(self.app)
+        result = self.run_script(reply="y\n")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("No bundle identifiers found", result.stderr)
+        self.assertNotIn("[y/N]", result.stderr)
+        self.assertEqual(self.resets(), [])
+
+    def test_custom_main_paths_and_cross_installation_ids_are_deduplicated(self):
+        chatgpt, _ = self.install_main_apps()
+        custom = self.root / "Custom Main.app"
+        self.bundle(custom, "com.example.client")  # Already in Computer Use.
+        other = self.root / "Renamed.app"
+        self.bundle(other, "com.example.custom")
+        result = self.run_script("--main-app", str(chatgpt) + "/.",
+                                 "--main-app", str(custom), "--main-app", str(other), reply="y\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.resets()), 18)
+        self.assertEqual(len(set(self.resets())), 18)
+        self.assertIn("reset AppleEvents com.example.custom", self.resets())
+
+    def test_explicit_missing_paths_fail_even_when_other_apps_exist(self):
+        self.install_main_apps()
+        for option in ("--app", "--main-app"):
+            with self.subTest(option=option):
+                result = self.run_script(option, str(self.root / "Missing.app"), reply="y\n")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("Not an application bundle", result.stderr)
                 self.assertNotIn("[y/N]", result.stderr)
                 self.assertEqual(self.resets(), [])
+
+    def test_default_reset_excludes_installed_main_apps(self):
+        self.install_main_apps()
+        result = self.run_script(reply="y\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.resets()), 9)
+        self.assertEqual({line.split()[2] for line in self.resets()},
+                         {"com.example.computeruse", "com.example.client", "com.example.worker"})
+        self.assertNotIn("com.example.mainchat", result.stdout)
+        self.assertNotIn("com.example.maincode", result.stdout)
+        self.assertEqual(result.stderr.count("[y/N]"), 1)
+
+    def test_default_diagnose_excludes_installed_main_apps(self):
+        self.install_main_apps()
+        result = self.run_script("--diagnose")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("com.example.mainchat", result.stdout)
+        self.assertNotIn("com.example.maincode", result.stdout)
+        self.assertEqual(self.resets(), [])
+
+    def test_default_does_not_fall_back_to_main_apps_without_computer_use(self):
+        self.install_main_apps()
+        shutil.rmtree(self.app)
+        result = self.run_script(reply="y\n")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("[y/N]", result.stderr)
+        self.assertNotIn("com.example.mainchat", result.stdout)
+        self.assertEqual(self.resets(), [])
 
 
 if __name__ == "__main__":

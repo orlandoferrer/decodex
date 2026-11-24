@@ -1,37 +1,70 @@
 #!/bin/bash
-# Discover Codex Computer Use identities and reset their macOS TCC decisions.
+# Discover ChatGPT/Codex and Computer Use identities and reset TCC decisions.
 # Compatible with the Bash 3.2 included with macOS. Never requires sudo.
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: bash decodex.sh [--diagnose] [--app PATH]
+Usage: bash decodex.sh [--diagnose] [--app PATH] [--include-main-apps]
+                      [--main-app PATH ...]
 
-Discover all Computer Use bundles, then ask once before resetting their
-Accessibility, Screen Recording, and Automation decisions.
+By default, target only Computer Use and its helpers. Ask once before
+resetting Accessibility, Screen Recording, and Automation decisions.
 --diagnose     List bundle identities only; change nothing.
 --app PATH     Discover bundles inside a specific Computer Use .app.
+--include-main-apps  Also discover and target the main ChatGPT/Codex apps.
+--main-app PATH  Add a main app path; repeatable; implies --include-main-apps.
 --help         Show this help.
+
+With --include-main-apps, main apps are found in /Applications and
+~/Applications. Bundle IDs are read from metadata. A missing default
+Computer Use runtime is skipped; no main apps are targeted without opt-in.
 
 Resetting forgets previous allow/deny decisions. It does not grant access or
 toggle switches. macOS may ask again when Computer Use next requests access.
-Quit Computer Use before resetting; restart it afterward if necessary.
+Quit ChatGPT/Codex and Computer Use before resetting; restart afterward.
 All discovered identities are targeted, even if they have no stored decision.
 Discovery does not establish which bundle owns a particular TCC permission.
 EOF
 }
 
+if [ "$#" -eq 0 ]; then
+  cat <<'EOF'
+Default run: reset permissions for Computer Use and its helpers only.
+Optional parameters for another run:
+  --include-main-apps  Also reset permissions for ChatGPT/Codex.
+  --diagnose           Preview targets without changing permissions.
+  --app PATH           Use a different Computer Use installation.
+  --main-app PATH      Add a main app path (implies --include-main-apps).
+  --help               Show full usage.
+Example: bash decodex.sh --include-main-apps
+
+EOF
+fi
+
 diagnose=0
+explicit_app=0
+include_main_apps=0
+main_apps=()
 app_path="${CODEX_HOME:-$HOME/.codex}/computer-use/Codex Computer Use.app"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --diagnose) diagnose=1 ;;
-    --app)
-      [ "$#" -ge 2 ] || { echo '--app requires a path.' >&2; exit 2; }
+    --include-main-apps) include_main_apps=1 ;;
+    --app|--main-app)
+      option=$1
+      [ "$#" -ge 2 ] || { echo "$option requires a path." >&2; exit 2; }
       case "$2" in
-        ''|-*) echo '--app requires a path. Prefix paths beginning with - with ./.' >&2; exit 2 ;;
+        ''|-*) echo "$option requires a path. Prefix paths beginning with - with ./." >&2; exit 2 ;;
       esac
-      app_path=$2; shift ;;
+      if [ "$option" = --app ]; then
+        app_path=$2
+        explicit_app=1
+      else
+        main_apps+=("$2")
+        include_main_apps=1
+      fi
+      shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -40,29 +73,50 @@ done
 [ "$(uname -s)" = Darwin ] || { echo 'This script requires macOS.' >&2; exit 1; }
 [ "${EUID}" -ne 0 ] || { echo 'Run as your normal logged-in user, without sudo.' >&2; exit 1; }
 
-if [ ! -d "$app_path" ]; then
-  if [ "$diagnose" -eq 1 ] || [ ! -t 0 ]; then
-    echo "Computer Use not found: $app_path. Supply --app PATH." >&2; exit 1
-  fi
-  read -r -p 'Enter the full path to your Computer Use .app: ' app_path
-fi
-[ -d "$app_path" ] && [ -f "$app_path/Contents/Info.plist" ] || {
-  echo "Not an application bundle: $app_path" >&2; exit 1;
-}
-# Normalize relative paths, trailing /. and a symlink supplied as the root.
-app_path=$(cd -- "$app_path" && pwd -P) || {
-  echo 'Could not resolve the application path.' >&2; exit 1;
-}
-
 # Finish traversal and check its status before consuming any partial results.
 # Nested symlinks are deliberately not followed outside the installation.
 discovery_file=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/decodex.XXXXXX")
 trap '/bin/rm -f "$discovery_file"' EXIT
-printf '%s\0' "$app_path" > "$discovery_file"
-if ! /usr/bin/find "$app_path" -mindepth 1 -type d \( -name '*.app' -o -name '*.xpc' \) -print0 >> "$discovery_file"; then
-  echo 'Could not completely discover Computer Use components. No permissions were reset.' >&2
-  exit 1
+
+add_root() {
+  local root=$1
+  local include_helpers=$2
+  [ -d "$root" ] && [ -f "$root/Contents/Info.plist" ] || {
+    echo "Not an application bundle: $root" >&2; exit 1;
+  }
+  # Include the root explicitly, regardless of its name or path spelling.
+  root=$(cd -- "$root" && pwd -P) || {
+    echo "Could not resolve the application path: $root" >&2; exit 1;
+  }
+  printf '%s\0' "$root" >> "$discovery_file"
+  if [ "$include_helpers" -eq 1 ]; then
+    if ! /usr/bin/find "$root" -mindepth 1 -type d \( -name '*.app' -o -name '*.xpc' \) -print0 >> "$discovery_file"; then
+      echo 'Could not completely discover Computer Use components. No permissions were reset.' >&2
+      exit 1
+    fi
+  fi
+}
+
+if [ "$explicit_app" -eq 1 ] || [ -e "$app_path" ] || [ -L "$app_path" ]; then
+  add_root "$app_path" 1
+else
+  echo "Computer Use not found: $app_path (skipping). Use --app PATH for another location." >&2
 fi
+
+if [ "$include_main_apps" -eq 1 ]; then
+  application_dirs=("/Applications" "$HOME/Applications")
+  for directory in "${application_dirs[@]}"; do
+    for name in ChatGPT.app Codex.app; do
+      candidate="$directory/$name"
+      if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+        main_apps+=("$candidate")
+      fi
+    done
+  done
+fi
+for main_app in "${main_apps[@]+${main_apps[@]}}"; do
+  add_root "$main_app" 0
+done
 
 ids=()
 paths=()
@@ -78,7 +132,7 @@ while IFS= read -r -d '' bundle; do
   paths+=("$bundle")
 done < "$discovery_file"
 
-[ "${#ids[@]}" -gt 0 ] || { echo 'No bundle identifiers found.' >&2; exit 1; }
+[ "${#ids[@]}" -gt 0 ] || { echo 'No bundle identifiers found. Use --app PATH or --main-app PATH for another location.' >&2; exit 1; }
 printf '\nDiscovered identities (including helpers, which may not own permissions):\n'
 for ((i=0; i<${#ids[@]}; i++)); do
   printf '\n  %d) %s\n     %s\n' "$((i+1))" "${ids[$i]}" "${paths[$i]}"
