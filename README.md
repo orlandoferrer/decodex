@@ -72,6 +72,10 @@ The script uses macOS `tccutil reset` with a specific service and bundle ID. It 
 
 Quit Computer Use before resetting. If including main apps, quit ChatGPT/Codex too. Restart them afterward if necessary. The script reports individual reset failures and returns a nonzero exit status if any reset fails. Resetting the main app's permissions can also affect features outside Computer Use, such as screenshots and Work with Apps.
 
+Every completed reset run ends with counts of successful, failed, and attempted resets, for example: `Reset summary: 3 succeeded, 9 failed (12 attempted).` Each count represents one service/bundle-ID pair, based on the reset command's exit status; a successful command does not prove a permission had previously been granted.
+
+If `tccutil` reports “No such bundle identifier,” the summary explains how many failed resets targeted IDs macOS could not find. A helper can exist on disk without macOS recognizing its ID for permission resets. Other failures are counted separately and retain their original error messages. Successful resets are still reported when other attempts fail.
+
 ## Current limitations
 
 - Bundle discovery identifies installed components, not existing permission grants. The script attempts all three resets for every discovered identity, including helpers that may have no stored decisions.

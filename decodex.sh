@@ -148,18 +148,37 @@ fi
 case "$answer" in y|Y|yes|YES) ;; *) echo 'Cancelled.'; exit 0 ;; esac
 
 services=(Accessibility ScreenCapture AppleEvents)
+successes=0
 failures=0
+not_found=0
 for id in "${ids[@]}"; do
   for service in "${services[@]}"; do
     printf '\nResetting %s for %s\n' "$service" "$id"
-    if ! /usr/bin/tccutil reset "$service" "$id"; then
+    if reset_output=$(LC_ALL=C /usr/bin/tccutil reset "$service" "$id" 2>&1); then
+      [ -z "$reset_output" ] || printf '%s\n' "$reset_output"
+      successes=$((successes+1))
+    else
+      [ -z "$reset_output" ] || printf '%s\n' "$reset_output" >&2
       failures=$((failures+1))
+      case "$reset_output" in
+        *'No such bundle identifier'*) not_found=$((not_found+1)) ;;
+      esac
       printf 'Reset failed: %s / %s\n' "$service" "$id" >&2
     fi
   done
 done
+printf '\nReset summary: %d succeeded, %d failed (%d attempted).\n' "$successes" "$failures" "$((successes+failures))"
+if [ "$not_found" -gt 0 ]; then
+  printf '\n%d failed reset(s) targeted bundle IDs that macOS could not find.\n' "$not_found"
+  printf 'Those reset attempts did not complete. Finding a helper on disk does not\nnecessarily mean macOS recognizes its bundle ID for permission resets.\n'
+fi
+other_failures=$((failures-not_found))
+if [ "$other_failures" -gt 0 ]; then
+  printf '\n%d reset(s) failed for other reasons; review the errors above.\n' "$other_failures" >&2
+fi
+if [ "$successes" -gt 0 ]; then
+  printf '\nThe %d successful reset(s) completed. macOS may request permission again on next use.\n' "$successes"
+fi
 if [ "$failures" -gt 0 ]; then
-  printf '\n%d reset(s) failed; review the errors above.\n' "$failures" >&2
   exit 1
 fi
-printf '\nResets completed. macOS may request permission again on next use.\n'

@@ -34,7 +34,11 @@ class DecodexTests(unittest.TestCase):
         mock.write_text(
             '#!/bin/bash\n'
             'printf "%s %s %s\\n" "$1" "$2" "$3" >> "$RESET_LOG"\n'
-            'if [ "${FAIL_SERVICE:-}" = "$2" ]; then exit 1; fi\n'
+            'if [ "${MISSING_ID:-}" = "$3" ]; then\n'
+            '  printf \'tccutil: No such bundle identifier "%s"\\n\' "$3" >&2\n'
+            '  exit 1\n'
+            'fi\n'
+            'if [ "${FAIL_SERVICE:-}" = "$2" ] || [ "${FAIL_SERVICE:-}" = "*" ]; then exit 1; fi\n'
         )
         mock.chmod(0o755)
         source = (Path(__file__).resolve().parents[1] / "decodex.sh").read_text()
@@ -54,8 +58,9 @@ class DecodexTests(unittest.TestCase):
         with (contents / "Info.plist").open("wb") as stream:
             plistlib.dump({"CFBundleIdentifier": identifier}, stream)
 
-    def run_script(self, *args, reply=None, fail_service="", cwd=None):
-        env = dict(os.environ, RESET_LOG=str(self.log), FAIL_SERVICE=fail_service)
+    def run_script(self, *args, reply=None, fail_service="", missing_id="", cwd=None):
+        env = dict(os.environ, RESET_LOG=str(self.log), FAIL_SERVICE=fail_service,
+                   MISSING_ID=missing_id)
         env["HOME"] = str(self.user_home)
         # Exercise the default CODEX_HOME discovery path as well as --app.
         env["CODEX_HOME"] = str(self.root / "codex home")
@@ -106,6 +111,7 @@ class DecodexTests(unittest.TestCase):
         }
         self.assertEqual(set(self.resets()), expected)
         self.assertEqual(len(self.resets()), 9)
+        self.assertIn("Reset summary: 9 succeeded, 0 failed (9 attempted).", result.stdout)
         self.assertEqual(result.stderr.count("[y/N]"), 1)
         self.assertNotIn("Select identity", result.stdout + result.stderr)
 
@@ -128,7 +134,36 @@ class DecodexTests(unittest.TestCase):
                                  fail_service="AppleEvents")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(len(self.resets()), 9)
-        self.assertIn("3 reset(s) failed", result.stderr)
+        self.assertIn("Reset summary: 6 succeeded, 3 failed (9 attempted).", result.stdout)
+        self.assertIn("review the errors above", result.stderr)
+        self.assertIn("3 reset(s) failed for other reasons", result.stderr)
+        self.assertNotIn("macOS could not find", result.stdout)
+
+    def test_missing_bundle_failures_are_explained(self):
+        result = self.run_script(reply="y\n", missing_id="com.example.client")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Reset summary: 6 succeeded, 3 failed (9 attempted).", result.stdout)
+        self.assertIn("3 failed reset(s) targeted bundle IDs that macOS could not find", result.stdout)
+        self.assertIn("Those reset attempts did not complete", result.stdout)
+        self.assertIn("The 6 successful reset(s) completed", result.stdout)
+        self.assertIn('No such bundle identifier "com.example.client"', result.stderr)
+        self.assertNotIn("failed for other reasons", result.stderr)
+
+    def test_missing_bundle_and_other_failures_are_counted_separately(self):
+        result = self.run_script(reply="y\n", missing_id="com.example.client",
+                                 fail_service="AppleEvents")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(self.resets()), 9)
+        self.assertIn("Reset summary: 4 succeeded, 5 failed (9 attempted).", result.stdout)
+        self.assertIn("3 failed reset(s) targeted bundle IDs that macOS could not find", result.stdout)
+        self.assertIn("2 reset(s) failed for other reasons", result.stderr)
+
+    def test_summary_reports_zero_successes_when_all_resets_fail(self):
+        result = self.run_script(reply="y\n", fail_service="*")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(self.resets()), 9)
+        self.assertIn("Reset summary: 0 succeeded, 9 failed (9 attempted).", result.stdout)
+        self.assertNotIn("macOS may request permission again", result.stdout)
 
     def test_removed_automation_flag_is_rejected(self):
         result = self.run_script("--automation")
